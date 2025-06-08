@@ -1,0 +1,13 @@
+Bu bir test dosyasıdır.
+
+Dosya aktarım sisteminin test edilmesi için oluşturulmuştur.
+
+İçerik:
+1. Metin verisi
+2. Sayısal veriler: 123, 456, 789
+3. Özel karakterler: !@#$%^&*()
+4. Türkçe karakterler: ğüşıöçĞÜŞİÖÇ
+
+Bu dosya, sistemin farklı karakter setlerini ve veri tiplerini doğru şekilde aktarabilme yeteneğini test etmek için kullanılacaktır.
+
+Son satır. 
