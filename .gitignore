@@ -1,1 +1,22 @@
-venv/ 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Sistem
+.DS_Store
+Thumbs.db
+
+# Proje özel
+encryption.key
+received_*.txt 

@@ -11,8 +11,92 @@ import hashlib
 from security import SecurityManager
 from network_utils import NetworkUtils
 import time
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.backends import default_backend
+import random
+import string
+import json
 
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
+
+# Dosya parçalama işlevi: Belirtilen dosyayı belirli bir boyutta parçalara böler.
+def split_file(file_path, chunk_size=1024 * 1024):  # 1MB chunks
+    file_name = os.path.basename(file_path)
+    file_size = os.path.getsize(file_path)
+    chunks = []
+    with open(file_path, 'rb') as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    return chunks, file_name
+
+# Dosya birleştirme işlevi: Parçalanmış dosyaları birleştirir.
+def merge_chunks(chunks, output_file):
+    with open(output_file, 'wb') as f:
+        for chunk in chunks:
+            f.write(chunk)
+
+# RSA anahtar çifti oluşturma
+def generate_rsa_keys():
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend()
+    )
+    public_key = private_key.public_key()
+    return private_key, public_key
+
+# Dosyayı RSA ile şifreleme
+def encrypt_file_with_rsa(file_path, public_key):
+    with open(file_path, 'rb') as f:
+        data = f.read()
+    encrypted_data = public_key.encrypt(
+        data,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+    return encrypted_data
+
+# Dosyayı RSA ile çözme
+def decrypt_file_with_rsa(encrypted_data, private_key):
+    decrypted_data = private_key.decrypt(
+        encrypted_data,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+    return decrypted_data
+
+# Doğrulama kodu oluşturma
+def generate_verification_code():
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+
+# Kullanıcıdan doğrulama kodu alma
+def get_verification_code():
+    return input("Doğrulama kodunu girin: ")
+
+# Doğrulama kodu kontrolü
+def verify_code(entered_code, correct_code):
+    return entered_code == correct_code
+
+# Ağ trafiğini yakalama ve şifreli verileri kontrol etme
+def capture_and_verify_traffic(interface, duration=10):
+    print(f"Ağ trafiği yakalanıyor... ({duration} saniye)")
+    packets = sniff(iface=interface, timeout=duration)
+    for packet in packets:
+        if IP in packet:
+            print(f"Paket: {packet.summary()}")
+            # Şifreli verilerin içeriğini kontrol et
+            if packet.haslayer('Raw'):
+                print(f"Şifreli veri: {packet['Raw'].load}")
 
 class FileTransferThread(QThread):
     progress = Signal(int)
@@ -36,29 +120,59 @@ class FileTransferThread(QThread):
         else:
             self.receive_file()
     
-    def send_file(self):
+    def create_ip_packet(self, src_ip, dst_ip, payload, ttl=64, flags="DF"):
+        """IP paketi oluştur"""
         try:
-            self.status.emit("Dosya gönderme başlatılıyor...")
-            print("Dosya gönderme başlatılıyor...") # Terminal çıktısı
-            # Dosya boyutunu ve hash'ini hesapla
+            # Flags değerini büyük harfe çevir ve kontrol et
+            flags = flags.upper() if flags else ""
+            if flags not in ["DF", "MF", ""]:
+                flags = "DF"  # Varsayılan değer
+            
+            # IP başlığı oluştur
+            ip_header = IP(
+                src=src_ip,
+                dst=dst_ip,
+                ttl=ttl,
+                flags=flags
+            )
+            
+            # TCP başlığı oluştur
+            tcp_header = TCP(
+                sport=RandShort(),
+                dport=5000,
+                flags="S"
+            )
+            
+            # Paketi oluştur
+            packet = ip_header/tcp_header/Raw(load=payload)
+            return packet
+        except Exception as e:
+            print(f"IP paketi oluşturma hatası: {e}")
+            return None
+
+    def send_file(self):
+        """Dosya gönderme işlemi"""
+        try:
+            # Socket oluştur
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((self.host, self.port))
+            
+            # Dosya bilgilerini gönder
+            file_name = os.path.basename(self.file_path)
             file_size = os.path.getsize(self.file_path)
             file_hash = self.security.calculate_file_hash(self.file_path)
             
-            # TCP soketi oluştur
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((self.host, self.port))
-            self.status.emit(f"{self.host}:{self.port} adresine bağlanıldı.")
+            header = {
+                "file_name": file_name,
+                "file_size": file_size,
+                "file_hash": file_hash
+            }
+            sock.send(json.dumps(header).encode())
             
-            # Header bilgilerini gönder
-            file_name = os.path.basename(self.file_path)
-            header = f"{file_name}|{file_size}|{file_hash}"
-            sock.sendall(header.encode())
-            self.status.emit("Dosya başlığı gönderildi.")
-            
-            # Dosyayı parçalara bölerek gönder
-            sent = 0
+            # Dosyayı parçalara böl ve gönder
             with open(self.file_path, 'rb') as f:
-                while sent < file_size:
+                total_sent = 0
+                while True:
                     chunk = f.read(CHUNK_SIZE)
                     if not chunk:
                         break
@@ -66,110 +180,109 @@ class FileTransferThread(QThread):
                     # Chunk'ı şifrele
                     encrypted_chunk = self.security.encrypt_data(chunk)
                     
-                    # IP başlığı oluştur (kullanıcı tarafından belirlenen TTL ve Flags ile)
-                    # Burada Scapy ile doğrudan paketi göndermiyoruz, sadece soket üzerinden veri akışı sağlıyoruz
-                    # IP başlığı manipülasyonu soket seviyesinde değil, daha düşük seviyede (RAW soket) gereklidir.
-                    # Mevcut TCP soketi kullanımı bu tür bir manipülasyona izin vermez.
-                    # Sadece gösterim amaçlı olarak IP başlığı oluşturma kısmı kalabilir.
-                    # Gerçek bir düşük seviye IP başlığı manipülasyonu için RAW soket veya Scapy'nin send/sr fonksiyonları gerekir.
-                    
-                    # Örnek IP başlığı oluşturma (şu anki TCP soketi için doğrudan kullanılmaz)
-                    # ip_header = IP(
-                    #    src=sock.getsockname()[0], # Kendi IP adresimiz
-                    #    dst=self.host,
-                    #    ttl=self.ttl,
-                    #    flags=self.flags if self.flags != "None" else ""
-                    # )
-                    
-                    sock.sendall(encrypted_chunk)
-                    
-                    sent += len(chunk)
-                    progress = int((sent / file_size) * 100)
+                    # Şifrelenmiş chunk'ı gönder
+                    sock.send(encrypted_chunk)
+                    total_sent += len(chunk)
+                    progress = int((total_sent / file_size) * 100)
                     self.progress.emit(progress)
-                    print(f"Gönderilen: {progress}%") # Terminal çıktısı
+                    print(f"Gönderilen: {progress}%")
             
-            self.status.emit("Dosya başarıyla gönderildi!")
-            print("Dosya başarıyla gönderildi!") # Terminal çıktısı
             sock.close()
+            self.status.emit("Dosya başarıyla gönderildi")
             
-        except socket.error as e:
-            self.status.emit(f"Soket Hatası: {e}. Port kullanımda olabilir veya bağlantı sorunları var.")
-            print(f"Soket Hatası (Gönderme): {e}") # Terminal çıktısı
         except Exception as e:
             self.status.emit(f"Gönderme Hatası: {str(e)}")
-            print(f"Gönderme Hatası: {str(e)}") # Terminal çıktısı
     
     def receive_file(self):
         try:
             self.status.emit("Dosya alma başlatılıyor... Bağlantı bekleniyor.")
-            print("Dosya alma başlatılıyor... Bağlantı bekleniyor.") # Terminal çıktısı
+            print("Dosya alma başlatılıyor... Bağlantı bekleniyor.")
+            
             # TCP soketi oluştur
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # Portu tekrar kullanmayı dene
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((self.host, self.port))
             sock.listen(1)
             
             self.status.emit(f"{self.host}:{self.port} adresinde bağlantı bekleniyor...")
-            print(f"{self.host}:{self.port} adresinde bağlantı bekleniyor...") # Terminal çıktısı
+            print(f"{self.host}:{self.port} adresinde bağlantı bekleniyor...")
             conn, addr = sock.accept()
             self.status.emit(f"{addr[0]}:{addr[1]} adresinden bağlantı kabul edildi.")
-            print(f"{addr[0]}:{addr[1]} adresinden bağlantı kabul edildi.") # Terminal çıktısı
+            print(f"{addr[0]}:{addr[1]} adresinden bağlantı kabul edildi.")
             
-            # Header'ı al
-            header = conn.recv(1024).decode()
-            file_name, file_size, file_hash = header.split('|')
-            file_size = int(file_size)
+            # Header'ı al ve JSON olarak parse et
+            header_data = conn.recv(1024).decode()
+            try:
+                header = json.loads(header_data)
+                file_name = header["file_name"]
+                file_size = int(header["file_size"])
+                file_hash = header["file_hash"]
+            except (json.JSONDecodeError, KeyError) as e:
+                raise Exception(f"Header işleme hatası: {str(e)}")
+            
             self.status.emit(f"Alınacak dosya: {file_name} ({file_size} bytes)")
-            print(f"Alınacak dosya: {file_name} ({file_size} bytes)") # Terminal çıktısı
+            print(f"Alınacak dosya: {file_name} ({file_size} bytes)")
 
             # Dosyayı proje klasörüne kaydet
             output_file_path = os.path.join(os.getcwd(), file_name)
             received = 0
+            chunks = []
             
-            with open(output_file_path, 'wb') as f:
-                while received < file_size:
-                    # Şifrelenmiş chunk'ı al
-                    encrypted_chunk = conn.recv(CHUNK_SIZE)
-                    if not encrypted_chunk:
-                        break
-                    
+            # Veriyi al ve çöz
+            while received < file_size:
+                chunk = conn.recv(CHUNK_SIZE)
+                if not chunk:
+                    break
+                
+                try:
                     # Chunk'ı çöz
-                    chunk = self.security.decrypt_data(encrypted_chunk)
-                    f.write(chunk)
-                    
-                    received += len(chunk)
+                    decrypted_chunk = self.security.decrypt_data(chunk)
+                    chunks.append(decrypted_chunk)
+                    received += len(decrypted_chunk)
                     progress = int((received / file_size) * 100)
                     self.progress.emit(progress)
-                    print(f"Alınan: {progress}%") # Terminal çıktısı
+                    print(f"Alınan: {progress}%")
+                except Exception as e:
+                    print(f"Chunk çözme hatası: {e}")
+                    continue
+            
+            # Tüm parçaları dosyaya yaz
+            with open(output_file_path, 'wb') as f:
+                for chunk in chunks:
+                    f.write(chunk)
             
             # Dosya bütünlüğünü kontrol et
-            if self.security.verify_file_integrity(output_file_path, file_hash):
+            current_hash = self.security.calculate_file_hash(output_file_path)
+            print(f"Hash uyuşmazlığı: Beklenen: {file_hash}, Alınan: {current_hash}")
+            
+            if current_hash == file_hash:
                 self.status.emit(f"Dosya başarıyla alındı ve bütünlüğü doğrulandı: {file_name}")
-                print(f"Dosya başarıyla alındı ve bütünlüğü doğrulandı: {file_name}") # Terminal çıktısı
+                print(f"Dosya başarıyla alındı ve bütünlüğü doğrulandı: {file_name}")
                 # Başarılı alım onayı için boş bir dosya oluştur
                 with open(os.path.join(os.getcwd(), f"received_{file_name}.txt"), "w") as f:
                     f.write(f"Dosya {file_name} başarıyla alındı ve {time.ctime()} tarihinde kaydedildi.")
-                print(f"Onay dosyası oluşturuldu: received_{file_name}.txt") # Terminal çıktısı
+                print(f"Onay dosyası oluşturuldu: received_{file_name}.txt")
             else:
-                os.remove(output_file_path) # Hatalı dosyayı sil
+                os.remove(output_file_path)
                 self.status.emit("Dosya bütünlüğü doğrulanamadı! Dosya silindi.")
-                print("Dosya bütünlüğü doğrulanamadı! Dosya silindi.") # Terminal çıktısı
+                print("Dosya bütünlüğü doğrulanamadı! Dosya silindi.")
             
             conn.close()
             sock.close()
-            print("Soketler kapatıldı.") # Terminal çıktısı
+            print("Soketler kapatıldı.")
             
         except socket.error as e:
             self.status.emit(f"Soket Hatası: {e}. Port kullanımda olabilir veya bağlantı sorunları var.")
-            print(f"Soket Hatası (Alma): {e}") # Terminal çıktısı
+            print(f"Soket Hatası (Alma): {e}")
         except Exception as e:
             self.status.emit(f"Alma Hatası: {str(e)}")
-            print(f"Alma Hatası: {str(e)}") # Terminal çıktısı
+            print(f"Alma Hatası: {str(e)}")
 
 class WorkerThread(QThread):
     status = Signal(str)
     network_stats_result = Signal(dict)
     mitm_result_signal = Signal(bool)
+    finished = Signal()
 
     def __init__(self, task_type, host=None, port=None, interface=None):
         super().__init__()
@@ -178,36 +291,42 @@ class WorkerThread(QThread):
         self.port = port
         self.interface = interface
         self.network = NetworkUtils()
+        self._is_running = True
+
+    def stop(self):
+        self._is_running = False
 
     def run(self):
         try:
             if self.task_type == "network_performance":
                 self.status.emit("Ağ performans testi yapılıyor...")
-                print("Ağ performans testi yapılıyor...") # Terminal çıktısı
+                print("Ağ performans testi yapılıyor...")
                 rtt = self.network.measure_rtt(self.host)
                 self.status.emit("Bant genişliği ölçümü için iperf3 sunucusunun (iperf3 -s) çalışıyor olması gerekir.")
-                print("Bant genişliği ölçümü için iperf3 sunucusunun (iperf3 -s) çalışıyor olması gerekir.") # Terminal çıktısı
+                print("Bant genişliği ölçümü için iperf3 sunucusunun (iperf3 -s) çalışıyor olması gerekir.")
                 bandwidth = self.network.measure_bandwidth(self.host, self.port) 
                 self.network_stats_result.emit({"rtt": rtt, "bandwidth": bandwidth})
                 self.status.emit("Ağ performans testi tamamlandı.")
-                print("Ağ performans testi tamamlandı.") # Terminal çıktısı
+                print("Ağ performans testi tamamlandı.")
             elif self.task_type == "mitm_simulation":
                 self.status.emit("MITM simülasyonu (ARP Zehirlenmesi Tespiti) başlatılıyor...")
-                print("MITM simülasyonu (ARP Zehirlenmesi Tespiti) başlatılıyor...") # Terminal çıktısı
+                print("MITM simülasyonu (ARP Zehirlenmesi Tespiti) başlatılıyor...")
                 is_spoofing_detected = self.network.detect_arp_spoofing(self.interface)
-                self.mitm_result_signal.emit(is_spoofing_detected) # Sinyali emit et
+                self.mitm_result_signal.emit(is_spoofing_detected)
                 if is_spoofing_detected is True:
                     self.status.emit("MITM Simülasyonu: ARP Zehirlenmesi TESPIT EDILDI!")
-                    print("MITM Simülasyonu: ARP Zehirlenmesi TESPIT EDILDI!") # Terminal çıktısı
+                    print("MITM Simülasyonu: ARP Zehirlenmesi TESPIT EDILDI!")
                 elif is_spoofing_detected is False:
                     self.status.emit("MITM Simülasyonu: ARP Zehirlenmesi TESPIT EDILMEDI.")
-                    print("MITM Simülasyonu: ARP Zehirlenmesi TESPIT EDILMEDI.") # Terminal çıktısı
+                    print("MITM Simülasyonu: ARP Zehirlenmesi TESPIT EDILMEDI.")
                 else:
                     self.status.emit("MITM Simülasyonu: Tespit sırasında bir hata oluştu.")
-                    print("MITM Simülasyonu: Tespit sırasında bir hata oluştu.") # Terminal çıktısı
+                    print("MITM Simülasyonu: Tespit sırasında bir hata oluştu.")
         except Exception as e:
             self.status.emit(f"Çalışan İşlem Hatası: {str(e)}")
-            print(f"Çalışan İşlem Hatası: {str(e)}") # Terminal çıktısı
+            print(f"Çalışan İşlem Hatası: {str(e)}")
+        finally:
+            self.finished.emit()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -219,6 +338,11 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
+        
+        # Thread yönetimi için değişkenler
+        self.worker_thread = None
+        self.transfer_thread = None
+        self.selected_file = None
         
         # Dosya seçme grubu
         file_group = QGroupBox("Dosya İşlemleri")
@@ -321,10 +445,6 @@ class MainWindow(QMainWindow):
         # Durum etiketi
         self.status_label = QLabel("")
         layout.addWidget(self.status_label)
-        
-        self.selected_file = None
-        self.transfer_thread = None
-        self.worker_thread = None # WorkerThread için referans
     
     def select_file(self):
         file_name, _ = QFileDialog.getOpenFileName(self, "Dosya Seç")
@@ -383,29 +503,80 @@ class MainWindow(QMainWindow):
             self.bandwidth_label.setText("Bant Genişliği: -- Mbps (Hata/Hesaplanamadı)")
 
     def test_network_performance(self):
-        host = self.host_input.currentText()
-        port = self.port_input.value()
-        
-        self.worker_thread = WorkerThread("network_performance", host=host, port=port)
-        self.worker_thread.status.connect(self.update_status)
-        self.worker_thread.network_stats_result.connect(self.update_network_stats)
-        self.worker_thread.start()
+        try:
+            # Eğer önceki thread varsa ve çalışıyorsa, bekle
+            if hasattr(self, 'worker_thread') and self.worker_thread is not None:
+                if self.worker_thread.isRunning():
+                    self.worker_thread.stop()
+                    self.worker_thread.wait()
+                self.worker_thread = None
+            
+            host = self.host_input.currentText()
+            # iperf3 varsayılan portu 5201'dir
+            port = 5201
+            
+            self.worker_thread = WorkerThread("network_performance", host=host, port=port)
+            self.worker_thread.status.connect(self.update_status)
+            self.worker_thread.network_stats_result.connect(self.update_network_stats)
+            self.worker_thread.finished.connect(self._on_worker_finished)
+            self.worker_thread.start()
+        except Exception as e:
+            self.status_label.setText(f"Hata: {str(e)}")
+            print(f"Network test hatası: {str(e)}")
 
     def test_mitm_simulation(self):
-        interface = self.interface_combo.currentText()
-        if not interface:
-            self.status_label.setText("Lütfen bir ağ arayüzü seçin!")
-            return
-        
-        self.worker_thread = WorkerThread("mitm_simulation", interface=interface)
-        self.worker_thread.status.connect(self.update_status)
-        # MITM sonuçlarını worker_thread içinden doğrudan gönderdiğimiz için burada ek bir işleme gerek yok.
-        self.worker_thread.mitm_result_signal.connect(self._handle_mitm_result)
-        self.worker_thread.start()
+        try:
+            # Eğer önceki thread varsa ve çalışıyorsa, bekle
+            if hasattr(self, 'worker_thread') and self.worker_thread is not None:
+                if self.worker_thread.isRunning():
+                    self.worker_thread.stop()
+                    self.worker_thread.wait()
+                self.worker_thread = None
+            
+            interface = self.interface_combo.currentText()
+            if not interface:
+                self.status_label.setText("Lütfen bir ağ arayüzü seçin!")
+                return
+            
+            self.worker_thread = WorkerThread("mitm_simulation", interface=interface)
+            self.worker_thread.status.connect(self.update_status)
+            self.worker_thread.mitm_result_signal.connect(self._handle_mitm_result)
+            self.worker_thread.finished.connect(self._on_worker_finished)
+            self.worker_thread.start()
+        except Exception as e:
+            self.status_label.setText(f"Hata: {str(e)}")
+            print(f"MITM test hatası: {str(e)}")
 
     def _handle_mitm_result(self, is_spoofing_detected):
         # WorkerThread'den gelen sinyali işler, mesaj WorkerThread içinde ayarlanmıştır.
         pass # Durum mesajı zaten WorkerThread tarafından ayarlandığı için burada ek bir işlem yapmıyoruz.
+
+    def _on_worker_finished(self):
+        """Worker thread tamamlandığında çağrılır"""
+        try:
+            if hasattr(self, 'worker_thread') and self.worker_thread is not None:
+                self.worker_thread.deleteLater()
+                self.worker_thread = None
+        except Exception as e:
+            print(f"Thread temizleme hatası: {str(e)}")
+
+    def closeEvent(self, event):
+        """Pencere kapatılırken thread'leri düzgün şekilde sonlandır"""
+        try:
+            if hasattr(self, 'worker_thread') and self.worker_thread is not None:
+                if self.worker_thread.isRunning():
+                    self.worker_thread.stop()
+                    self.worker_thread.wait()
+                self.worker_thread = None
+            
+            if hasattr(self, 'transfer_thread') and self.transfer_thread is not None:
+                if self.transfer_thread.isRunning():
+                    self.transfer_thread.wait()
+                self.transfer_thread = None
+        except Exception as e:
+            print(f"Kapatma hatası: {str(e)}")
+        finally:
+            event.accept()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
