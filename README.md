@@ -157,10 +157,8 @@ iperf3 -s
 4. Branch'inizi push edin
 5. Pull Request oluşturun
 
-## Lisans
 
-Bu proje MIT lisansı altında lisanslanmıştır. Detaylar için [LICENSE](LICENSE) dosyasına bakın.
 
 ## İletişim
 
-Sorularınız veya önerileriniz için [e-posta adresi] adresine mail atabilirsiniz. 
+Sorularınız veya önerileriniz için ervaaygunes8@gmail.com adresine mail atabilirsiniz. 
