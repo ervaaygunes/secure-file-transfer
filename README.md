@@ -75,7 +75,7 @@ source venv/bin/activate
 sudo python3 main.py
 ```
 1. Host olarak "localhost" veya "127.0.0.1" seçin
-2. Port olarak 5000 seçin
+2. Port olarak 5201 seçin
 3. "Al" butonuna tıklayın
 
 #### Gönderici Tarafı:
